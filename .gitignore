@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+venv/
+.venv/
+
+# Generated datasets
+dataset/
+datasets/
+output/
+outputs/
+recordings/
+
+# Large recordings
+*.bag
+*.db3
+*.mp4
+*.avi
+*.mkv
+
+# Logs
+*.log
+
+# IDE files
+.vscode/
+.idea/
+
+# Environment variables and secrets
+.env

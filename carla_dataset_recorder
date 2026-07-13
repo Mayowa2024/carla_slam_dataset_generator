@@ -1,0 +1,624 @@
+import carla
+import os
+import csv
+import json
+import time
+import random
+import shutil
+from pathlib import Path
+
+
+# =========================
+# Global dataset settings
+# =========================
+
+DATASET_ROOT = Path("carla_slam_dataset/sequences")
+
+HOST = "localhost"
+PORT = 2000
+TM_PORT = 8000
+
+MAP_NAME = "Town01"
+RANDOM_SEED = 42
+
+SIM_FPS = 100              # simulation + IMU rate
+CAMERA_FPS = 20            # stereo camera rate
+FIXED_DELTA_SECONDS = 1.0 / SIM_FPS
+
+IMAGE_WIDTH = 1280
+IMAGE_HEIGHT = 720
+FOV = 90
+BASELINE = 0.60
+
+EGO_SPAWN_POINT_INDEX = 0
+
+DYNAMIC_VEHICLES = 20
+DYNAMIC_PEDESTRIANS = 40
+
+
+# =========================
+# Weather helpers
+# =========================
+
+def weather_clear_night():
+    weather = carla.WeatherParameters()
+    weather.cloudiness = 10.0
+    weather.precipitation = 0.0
+    weather.precipitation_deposits = 0.0
+    weather.wind_intensity = 5.0
+    weather.sun_azimuth_angle = 0.0
+    weather.sun_altitude_angle = -25.0
+    weather.fog_density = 5.0
+    weather.fog_distance = 80.0
+    weather.wetness = 0.0
+    return weather
+
+
+def weather_rain_night():
+    weather = carla.WeatherParameters()
+    weather.cloudiness = 90.0
+    weather.precipitation = 80.0
+    weather.precipitation_deposits = 80.0
+    weather.wind_intensity = 50.0
+    weather.sun_azimuth_angle = 0.0
+    weather.sun_altitude_angle = -25.0
+    weather.fog_density = 20.0
+    weather.fog_distance = 50.0
+    weather.wetness = 90.0
+    return weather
+
+
+def get_weather_by_name(name):
+    if name == "ClearNoon":
+        return carla.WeatherParameters.ClearNoon
+    if name == "HardRainNoon":
+        return carla.WeatherParameters.HardRainNoon
+    if name == "CloudySunset":
+        return carla.WeatherParameters.CloudySunset
+    if name == "ClearSunset":
+        return carla.WeatherParameters.ClearSunset
+    if name == "ClearNight":
+        return weather_clear_night()
+    if name == "RainNight":
+        return weather_rain_night()
+
+    raise ValueError(f"Unknown weather condition: {name}")
+
+def update_spectator_follow(spectator, vehicle):
+    """
+    Moves the CARLA viewport camera so it follows behind the ego vehicle.
+    This does not affect the recorded stereo camera data.
+    It only changes what you see in the CARLA window.
+    """
+    ego_tf = vehicle.get_transform()
+    forward = ego_tf.get_forward_vector()
+
+    spectator_location = carla.Location(
+        x=ego_tf.location.x - 8.0 * forward.x,
+        y=ego_tf.location.y - 8.0 * forward.y,
+        z=ego_tf.location.z + 4.0
+    )
+
+    spectator_rotation = carla.Rotation(
+        pitch=-20.0,
+        yaw=ego_tf.rotation.yaw,
+        roll=0.0
+    )
+
+    spectator.set_transform(
+        carla.Transform(spectator_location, spectator_rotation)
+    )
+
+# =========================
+# Experiment definitions
+# =========================
+
+EXPERIMENTS ={
+        "id": "05_weather_cycle",
+        "name": "Weather cycle",
+        "type": "temporal_perceptual_variation",
+        "duration_seconds": 50,
+        "weather_schedule": [
+            {"start_seconds": 0, "condition": "ClearNoon"},
+            {"start_seconds": 10, "condition": "HardRainNoon"},
+            {"start_seconds": 20, "condition": "ClearSunset"},
+            {"start_seconds": 30, "condition": "ClearNight"},
+            {"start_seconds": 40, "condition": "RainNight"}
+        ],
+        "purpose": "Test whether SLAM remains stable as weather and lighting change during one continuous run."
+    },
+
+
+
+# =========================
+# Utility functions
+# =========================
+
+def make_clean_dir(path: Path):
+    if path.exists():
+        shutil.rmtree(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def get_transform_dict(transform):
+    return {
+        "x": transform.location.x,
+        "y": transform.location.y,
+        "z": transform.location.z,
+        "roll": transform.rotation.roll,
+        "pitch": transform.rotation.pitch,
+        "yaw": transform.rotation.yaw,
+    }
+
+
+def spawn_ego_vehicle(world, bp_lib):
+    vehicle_bp = bp_lib.filter("vehicle.tesla.model3")[0]
+    vehicle_bp.set_attribute("role_name", "ego_vehicle")
+
+    spawn_points = world.get_map().get_spawn_points()
+    spawn_point = spawn_points[EGO_SPAWN_POINT_INDEX]
+
+    vehicle = world.try_spawn_actor(vehicle_bp, spawn_point)
+    if vehicle is None:
+        raise RuntimeError("Could not spawn ego vehicle. Try changing EGO_SPAWN_POINT_INDEX.")
+
+    return vehicle
+
+
+def spawn_stereo_and_imu(world, bp_lib, vehicle, out_dir, image_records, imu_records):
+    actors = []
+
+    # RGB camera blueprint
+    cam_bp = bp_lib.find("sensor.camera.rgb")
+    cam_bp.set_attribute("image_size_x", str(IMAGE_WIDTH))
+    cam_bp.set_attribute("image_size_y", str(IMAGE_HEIGHT))
+    cam_bp.set_attribute("fov", str(FOV))
+    cam_bp.set_attribute("sensor_tick", str(1.0 / CAMERA_FPS))
+
+    left_tf = carla.Transform(
+        carla.Location(x=1.5, y=-BASELINE / 2.0, z=1.6),
+        carla.Rotation(roll=0.0, pitch=0.0, yaw=0.0)
+    )
+
+    right_tf = carla.Transform(
+        carla.Location(x=1.5, y=BASELINE / 2.0, z=1.6),
+        carla.Rotation(roll=0.0, pitch=0.0, yaw=0.0)
+    )
+
+    left_cam = world.spawn_actor(cam_bp, left_tf, attach_to=vehicle)
+    right_cam = world.spawn_actor(cam_bp, right_tf, attach_to=vehicle)
+
+    raw_left = out_dir / "raw_image_0"
+    raw_right = out_dir / "raw_image_1"
+    raw_left.mkdir(parents=True, exist_ok=True)
+    raw_right.mkdir(parents=True, exist_ok=True)
+
+    def left_callback(image):
+        filename = raw_left / f"{image.frame:09d}.png"
+        image.save_to_disk(str(filename))
+        image_records["left"][image.frame] = image.timestamp
+
+    def right_callback(image):
+        filename = raw_right / f"{image.frame:09d}.png"
+        image.save_to_disk(str(filename))
+        image_records["right"][image.frame] = image.timestamp
+
+    left_cam.listen(left_callback)
+    right_cam.listen(right_callback)
+
+    actors.extend([left_cam, right_cam])
+
+    # IMU blueprint
+    imu_bp = bp_lib.find("sensor.other.imu")
+    imu_bp.set_attribute("sensor_tick", str(1.0 / SIM_FPS))
+
+    # Attach IMU close to camera rig.
+    imu_tf = carla.Transform(
+        carla.Location(x=1.5, y=0.0, z=1.6),
+        carla.Rotation(roll=0.0, pitch=0.0, yaw=0.0)
+    )
+
+    imu = world.spawn_actor(imu_bp, imu_tf, attach_to=vehicle)
+
+    def imu_callback(data):
+        imu_records.append([
+            data.frame,
+            f"{data.timestamp:.9f}",
+            data.accelerometer.x,
+            data.accelerometer.y,
+            data.accelerometer.z,
+            data.gyroscope.x,
+            data.gyroscope.y,
+            data.gyroscope.z,
+            data.compass
+        ])
+
+    imu.listen(imu_callback)
+    actors.append(imu)
+
+    return actors
+
+
+def spawn_dynamic_actors(client, world, bp_lib, traffic_manager):
+    actors = []
+    vehicle_actors = []
+    walker_actors = []
+    walker_controllers = []
+
+    random.seed(RANDOM_SEED)
+
+    # Spawn vehicles
+    vehicle_bps = bp_lib.filter("vehicle.*")
+    vehicle_bps = [bp for bp in vehicle_bps if bp.has_attribute("number_of_wheels")]
+    spawn_points = world.get_map().get_spawn_points()
+    random.shuffle(spawn_points)
+
+    for spawn_point in spawn_points[:DYNAMIC_VEHICLES]:
+        bp = random.choice(vehicle_bps)
+
+        if bp.has_attribute("color"):
+            color = random.choice(bp.get_attribute("color").recommended_values)
+            bp.set_attribute("color", color)
+
+        vehicle = world.try_spawn_actor(bp, spawn_point)
+        if vehicle is not None:
+            vehicle.set_autopilot(True, traffic_manager.get_port())
+            vehicle_actors.append(vehicle)
+            actors.append(vehicle)
+
+    # Spawn pedestrians
+    walker_bps = bp_lib.filter("walker.pedestrian.*")
+    controller_bp = bp_lib.find("controller.ai.walker")
+
+    for _ in range(DYNAMIC_PEDESTRIANS):
+        loc = world.get_random_location_from_navigation()
+        if loc is None:
+            continue
+
+        walker_bp = random.choice(walker_bps)
+        walker = world.try_spawn_actor(walker_bp, carla.Transform(loc))
+        if walker is None:
+            continue
+
+        controller = world.try_spawn_actor(controller_bp, carla.Transform(), attach_to=walker)
+        if controller is None:
+            walker.destroy()
+            continue
+
+        walker_actors.append(walker)
+        walker_controllers.append(controller)
+        actors.extend([walker, controller])
+
+    world.tick()
+
+    for controller in walker_controllers:
+        controller.start()
+        target = world.get_random_location_from_navigation()
+        if target is not None:
+            controller.go_to_location(target)
+        controller.set_max_speed(1.4)
+
+    world.set_pedestrians_cross_factor(0.3)
+
+    return actors, len(vehicle_actors), len(walker_actors)
+
+
+def postprocess_images(out_dir, image_records, pose_by_frame):
+    raw_left = out_dir / "raw_image_0"
+    raw_right = out_dir / "raw_image_1"
+
+    final_left = out_dir / "image_0"
+    final_right = out_dir / "image_1"
+
+    final_left.mkdir(parents=True, exist_ok=True)
+    final_right.mkdir(parents=True, exist_ok=True)
+
+    matched_frames = sorted(set(image_records["left"].keys()) & set(image_records["right"].keys()))
+
+    times_path = out_dir / "times.txt"
+    frame_map_path = out_dir / "image_frames.csv"
+    pose_path = out_dir / "pose_gt.csv"
+
+    with open(times_path, "w") as times_file, \
+         open(frame_map_path, "w", newline="") as map_file, \
+         open(pose_path, "w", newline="") as pose_file:
+
+        map_writer = csv.writer(map_file)
+        pose_writer = csv.writer(pose_file)
+
+        map_writer.writerow(["image_index", "carla_frame", "timestamp"])
+        pose_writer.writerow(["image_index", "carla_frame", "timestamp", "x", "y", "z", "roll", "pitch", "yaw"])
+
+        for idx, frame in enumerate(matched_frames):
+            left_src = raw_left / f"{frame:09d}.png"
+            right_src = raw_right / f"{frame:09d}.png"
+
+            left_dst = final_left / f"{idx:06d}.png"
+            right_dst = final_right / f"{idx:06d}.png"
+
+            if not left_src.exists() or not right_src.exists():
+                continue
+
+            shutil.copy2(left_src, left_dst)
+            shutil.copy2(right_src, right_dst)
+
+            timestamp = image_records["left"][frame]
+            times_file.write(f"{timestamp:.9f}\n")
+            map_writer.writerow([idx, frame, f"{timestamp:.9f}"])
+
+            if frame in pose_by_frame:
+                p = pose_by_frame[frame]
+                pose_writer.writerow([
+                    idx,
+                    frame,
+                    f"{timestamp:.9f}",
+                    p["x"],
+                    p["y"],
+                    p["z"],
+                    p["roll"],
+                    p["pitch"],
+                    p["yaw"]
+                ])
+
+    return len(matched_frames)
+
+
+def write_imu_csv(out_dir, imu_records):
+    imu_path = out_dir / "imu.csv"
+
+    imu_records = sorted(imu_records, key=lambda row: row[0])
+
+    with open(imu_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "frame",
+            "timestamp",
+            "accel_x",
+            "accel_y",
+            "accel_z",
+            "gyro_x",
+            "gyro_y",
+            "gyro_z",
+            "compass"
+        ])
+        writer.writerows(imu_records)
+
+
+def write_weather_log(out_dir, weather_events):
+    with open(out_dir / "weather_log.csv", "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["frame", "sim_step", "time_seconds", "condition"])
+        writer.writerows(weather_events)
+
+
+def write_metadata(out_dir, experiment, run_group, dynamic_info, stereo_pairs):
+    metadata = {
+        "experiment": experiment,
+        "run_group": run_group,
+        "dynamic_scene": dynamic_info,
+        "simulation": {
+            "sim_fps": SIM_FPS,
+            "camera_fps": CAMERA_FPS,
+            "fixed_delta_seconds": FIXED_DELTA_SECONDS,
+            "map": MAP_NAME,
+            "random_seed": RANDOM_SEED,
+            "synchronous_mode": True,
+        },
+        "sensors": {
+            "stereo_camera": {
+                "width": IMAGE_WIDTH,
+                "height": IMAGE_HEIGHT,
+                "fov_degrees": FOV,
+                "baseline_m": BASELINE,
+                "fps": CAMERA_FPS,
+                "estimated_fx": IMAGE_WIDTH / 2.0,
+                "estimated_fy": IMAGE_WIDTH / 2.0,
+                "estimated_cx": IMAGE_WIDTH / 2.0,
+                "estimated_cy": IMAGE_HEIGHT / 2.0,
+                "estimated_orbslam3_bf": (IMAGE_WIDTH / 2.0) * BASELINE
+            },
+            "imu": {
+                "enabled": True,
+                "fps": SIM_FPS,
+                "attached_transform": {
+                    "x": 1.5,
+                    "y": 0.0,
+                    "z": 1.6,
+                    "roll": 0.0,
+                    "pitch": 0.0,
+                    "yaw": 0.0
+                }
+            }
+        },
+        "output": {
+            "stereo_pairs": stereo_pairs,
+            "left_images_dir": "image_0",
+            "right_images_dir": "image_1",
+            "timestamps_file": "times.txt",
+            "imu_file": "imu.csv",
+            "ground_truth_file": "pose_gt.csv",
+            "weather_log_file": "weather_log.csv",
+            "image_frame_map": "image_frames.csv"
+        }
+    }
+
+    with open(out_dir / "metadata.json", "w") as f:
+        json.dump(metadata, f, indent=2)
+
+
+def run_single_experiment(client, experiment, dynamic_enabled):
+    run_group = "dynamic_runs" if dynamic_enabled else "static_runs"
+    suffix = "_dynamic" if dynamic_enabled else ""
+    out_dir = DATASET_ROOT / run_group / f"{experiment['id']}{suffix}"
+
+    print("\n" + "=" * 80)
+    print(f"Starting: {run_group}/{experiment['id']}{suffix}")
+    print("=" * 80)
+
+    make_clean_dir(out_dir)
+
+    world = client.load_world(MAP_NAME)
+    bp_lib = world.get_blueprint_library()
+
+    original_settings = world.get_settings()
+
+    actors = []
+    dynamic_actors = []
+
+    image_records = {
+        "left": {},
+        "right": {}
+    }
+
+    imu_records = []
+    pose_by_frame = {}
+    weather_events = []
+
+    try:
+        # Synchronous deterministic settings
+        settings = world.get_settings()
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = FIXED_DELTA_SECONDS
+        settings.substepping = True
+        settings.max_substep_delta_time = 0.01
+        settings.max_substeps = 10
+        world.apply_settings(settings)
+
+        traffic_manager = client.get_trafficmanager(TM_PORT)
+        traffic_manager.set_synchronous_mode(True)
+        traffic_manager.set_random_device_seed(RANDOM_SEED)
+
+        ego_vehicle = spawn_ego_vehicle(world, bp_lib)
+        actors.append(ego_vehicle)
+
+        ego_vehicle.set_autopilot(True, traffic_manager.get_port())
+        spectator = world.get_spectator()
+
+        sensor_actors = spawn_stereo_and_imu(
+            world,
+            bp_lib,
+            ego_vehicle,
+            out_dir,
+            image_records,
+            imu_records
+        )
+        actors.extend(sensor_actors)
+
+        dynamic_info = {
+            "enabled": dynamic_enabled,
+            "requested_vehicles": DYNAMIC_VEHICLES if dynamic_enabled else 0,
+            "requested_pedestrians": DYNAMIC_PEDESTRIANS if dynamic_enabled else 0,
+            "spawned_vehicles": 0,
+            "spawned_pedestrians": 0,
+            "random_seed": RANDOM_SEED
+        }
+
+        if dynamic_enabled:
+            dynamic_actors, n_vehicles, n_pedestrians = spawn_dynamic_actors(
+                client,
+                world,
+                bp_lib,
+                traffic_manager
+            )
+            actors.extend(dynamic_actors)
+            dynamic_info["spawned_vehicles"] = n_vehicles
+            dynamic_info["spawned_pedestrians"] = n_pedestrians
+
+        # Warm-up
+        for _ in range(50):
+            world.tick()
+
+        total_steps = int(experiment["duration_seconds"] * SIM_FPS)
+
+        schedule = sorted(experiment["weather_schedule"], key=lambda x: x["start_seconds"])
+        schedule_by_step = {
+            int(item["start_seconds"] * SIM_FPS): item["condition"]
+            for item in schedule
+        }
+
+        current_weather_name = None
+
+        for sim_step in range(total_steps):
+            if sim_step in schedule_by_step:
+                current_weather_name = schedule_by_step[sim_step]
+                world.set_weather(get_weather_by_name(current_weather_name))
+
+                current_frame = world.get_snapshot().frame
+                weather_events.append([
+                    current_frame,
+                    sim_step,
+                    sim_step / SIM_FPS,
+                    current_weather_name
+                ])
+
+                print(f"Weather changed at {sim_step / SIM_FPS:.1f}s -> {current_weather_name}")
+
+            frame = world.tick()
+            update_spectator_follow(spectator, ego_vehicle)
+            transform = ego_vehicle.get_transform()
+            pose_by_frame[frame] = get_transform_dict(transform)
+
+            if sim_step % SIM_FPS == 0:
+                print(
+                    f"{run_group}/{experiment['id']}{suffix}: "
+                    f"{sim_step / SIM_FPS:.0f}/{experiment['duration_seconds']}s "
+                    f"| weather={current_weather_name}"
+                )
+
+        # Give sensor callbacks a moment to finish disk writes
+        time.sleep(2.0)
+
+        stereo_pairs = postprocess_images(out_dir, image_records, pose_by_frame)
+        write_imu_csv(out_dir, imu_records)
+        write_weather_log(out_dir, weather_events)
+        write_metadata(out_dir, experiment, run_group, dynamic_info, stereo_pairs)
+
+        print(f"Finished {out_dir}")
+        print(f"Stereo pairs: {stereo_pairs}")
+        print(f"IMU rows: {len(imu_records)}")
+    finally:
+        print("Cleaning up actors...")
+
+    # Stop sensor callbacks first
+    for actor in reversed(actors):
+        try:
+            if actor is not None and actor.is_alive and actor.type_id.startswith("sensor."):
+                actor.stop()
+        except Exception:
+            pass
+
+    # Stop walker controllers before destroying walkers
+    for actor in reversed(actors):
+        try:
+            if actor is not None and actor.is_alive and actor.type_id.startswith("controller.ai.walker"):
+                actor.stop()
+        except Exception:
+            pass
+
+
+    try:
+        traffic_manager.set_synchronous_mode(False)
+    except Exception:
+        pass
+
+    try:
+        world.apply_settings(original_settings)
+    except Exception:
+        pass
+
+
+def main():
+    client = carla.Client(HOST, PORT)
+    client.set_timeout(120.0)
+
+    experiments_to_run = EXPERIMENTS
+
+    for experiment in experiments_to_run:
+        #run_single_experiment(client, experiment, dynamic_enabled=False)
+        run_single_experiment(client, experiment, dynamic_enabled=True)
+
+    print("All experiments completed.")
+
+
+if __name__ == "__main__":
+    main()

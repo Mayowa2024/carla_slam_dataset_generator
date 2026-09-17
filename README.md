@@ -261,19 +261,8 @@ carla-stereo-dataset-recorder/
 
 The exact filenames may differ depending on the implementation.
 
-## Limitations
 
-* The output is KITTI-style but may not be immediately compatible with every KITTI-based application.
-* Camera calibration must match the simulated sensor configuration.
-* CARLA coordinate frames may require conversion before trajectory evaluation.
-* Ground-truth and IMU formats should be verified against the requirements of the target SLAM algorithm.
-* Large datasets should be stored using external storage rather than normal Git tracking.
 
-## Licence
-
-Add an appropriate licence before distributing or publishing the project.
-
-For example, an MIT licence can be used when you own the code and are permitted to release it.
 
 ## Author
 
